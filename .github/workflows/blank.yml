@@ -1,7 +1,11 @@
 name: Domain Certification
 
 on:
+  issues:
+    # 监听 Issue 被创建的事件
+    types: [opened, labeled]
   issue_comment:
+    # 监听 Issue 评论事件
     types: [created]
 
 jobs:
@@ -24,43 +28,49 @@ jobs:
         sudo snap install --classic certbot
         sudo ln -s /snap/bin/certbot /usr/bin/certbot
 
-    # 从 Issue 提取域名并检查解析状态
-    - name: Extract domains and check DNS
-      id: extract_and_check
+    # 检查域名解析
+    - name: Check DNS resolution
+      id: check_dns
       run: |
-        ISSUE_BODY=$(curl -s -X GET -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" ${{ github.event.issue.url }}.json | jq -r '.body')
+        ISSUE_BODY=$(gh api -H "Accept: application/vnd.github.v3+json" ${{ github.event.issue.url }} | jq -r '.body')
         DOMAIN=$(echo "$ISSUE_BODY" | head -n 1 | tr -d '\r\n')
-        if ! host -t A "$DOMAIN" > /dev/null 2>&1; then
-          echo "Domain resolution failed for $DOMAIN, please ensure it's correctly setup."
+        
+        # 使用 Nslookup 来检验DNS解析。因为host命令在某些系统可能不可用
+        nslookup_output=$(nslookup $DOMAIN 2>&1)
+        if ! echo "$nslookup_output" | grep -q 'Address' ; then
+          echo "::error::DNS resolution failed for $DOMAIN. Please ensure the domain is correctly configured or wait for successful DNS propagation.";
           exit 1
         fi
         echo "::set-output name=domain::$DOMAIN"
 
     # 申请 Let's Encrypt 证书
     - name: Request SSL Certificate
-      if: steps.extract_and_check.outcome == 'success'
+      if: steps.check_dns.outcome == 'success'
       run: |
-        DOMAIN=${{ steps.extract_and_check.outputs.domain }}
-        if sudo certbot certonly --webroot --webroot-path /var/www/certbot -d $DOMAIN --agree-tos --non-interactive --email ssl-action@amethyst.icu 2>&1; then
-          sudo cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/fullchain.pem
-          sudo cp /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/privkey.pem
+        DOMAIN=${{ steps.check_dns.outputs.domain }}
+        if sudo certbot certonly --standalone --agree-tos --non-interactive --email ssl-action@amethyst.icu -d $DOMAIN 2>&1; then
+          sudo cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/
+          sudo cp /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/
           echo "Successfully applied for new certificate for domain: $DOMAIN";
         else
           echo "Failed to apply for certificate for domain: $DOMAIN";
           exit 1
         fi
     
-    # 发布到 Releases
+    # 发布到 Releases 并评论到 Issue 下
     - name: Create and upload release
-      if: steps.extract_and_check.outcome == 'success'
+      if: steps.check_dns.outcome == 'success'
       run: |
-        zip -r certificates.zip certificates/
-        RELEASE_BODY="SSL Certificate for ${{ steps.extract_and_check.outputs.domain }}"
+        DOMAIN=${{ steps.check_dns.outputs.domain }}
+        ZIPFILE="certificates.zip"
+        zip -r $ZIPFILE certificates/
+        
+        RELEASE_BODY="SSL Certificate for $DOMAIN"
         echo $RELEASE_BODY > release_body.txt
-        RELEASE_ID=$(gh release create "cert-release-for-${{ steps.extract_and_check.outputs.domain }}" certificates.zip --title "$RELEASE_BODY" -F release_body.txt -p | jq -r '.id')
+        RELEASE_ID=$(gh release create "cert-release-for-$DOMAIN" $ZIPFILE --title "$RELEASE_BODY" -F release_body.txt | jq -r '.id')
         RELEASE_URL=$(cat <<EOF
-        The SSL certificate for ${{ steps.extract_and_check.outputs.domain }} is now available at:
-        https://github.com/${{ github.repository }}/releases/tag/cert-release-for-${{ steps.extract_and_check.outputs.domain }}
+        The SSL certificate for $DOMAIN is now available at:
+        https://github.com/${{ github.repository }}/releases/tag/cert-release-for-$DOMAIN
         EOF
         )
         gh api -X POST /repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments -f body="$RELEASE_URL"
