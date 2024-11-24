@@ -1,0 +1,68 @@
+name: Domain Certification
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  check-and-apply-cert:
+    if: github.event.issue.pull_request == '' && github.event.comment.body == '解析完成'
+    runs-on: ubuntu-latest
+    steps:
+    # 签出代码
+    - uses: actions/checkout@v2
+
+    # 设置 Python 环境
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+
+    # 安装 Certbot
+    - name: Install Certbot
+      run: |
+        sudo snap install --classic certbot
+        sudo ln -s /snap/bin/certbot /usr/bin/certbot
+
+    # 从 Issue 提取域名并检查解析状态
+    - name: Extract domains and check DNS
+      id: extract_and_check
+      run: |
+        ISSUE_BODY=$(curl -s -X GET -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" ${{ github.event.issue.url }}.json | jq -r '.body')
+        DOMAIN=$(echo "$ISSUE_BODY" | head -n 1 | tr -d '\r\n')
+        if ! host -t A "$DOMAIN" > /dev/null 2>&1; then
+          echo "Domain resolution failed for $DOMAIN, please ensure it's correctly setup."
+          exit 1
+        fi
+        echo "::set-output name=domain::$DOMAIN"
+
+    # 申请 Let's Encrypt 证书
+    - name: Request SSL Certificate
+      if: steps.extract_and_check.outcome == 'success'
+      run: |
+        DOMAIN=${{ steps.extract_and_check.outputs.domain }}
+        if sudo certbot certonly --webroot --webroot-path /var/www/certbot -d $DOMAIN --agree-tos --non-interactive --email ssl-action@amethyst.icu 2>&1; then
+          sudo cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem ./certificates/fullchain.pem
+          sudo cp /etc/letsencrypt/live/$DOMAIN/privkey.pem ./certificates/privkey.pem
+          echo "Successfully applied for new certificate for domain: $DOMAIN";
+        else
+          echo "Failed to apply for certificate for domain: $DOMAIN";
+          exit 1
+        fi
+    
+    # 发布到 Releases
+    - name: Create and upload release
+      if: steps.extract_and_check.outcome == 'success'
+      run: |
+        zip -r certificates.zip certificates/
+        RELEASE_BODY="SSL Certificate for ${{ steps.extract_and_check.outputs.domain }}"
+        echo $RELEASE_BODY > release_body.txt
+        RELEASE_ID=$(gh release create "cert-release-for-${{ steps.extract_and_check.outputs.domain }}" certificates.zip --title "$RELEASE_BODY" -F release_body.txt -p | jq -r '.id')
+        RELEASE_URL=$(cat <<EOF
+        The SSL certificate for ${{ steps.extract_and_check.outputs.domain }} is now available at:
+        https://github.com/${{ github.repository }}/releases/tag/cert-release-for-${{ steps.extract_and_check.outputs.domain }}
+        EOF
+        )
+        gh api -X POST /repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments -f body="$RELEASE_URL"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
